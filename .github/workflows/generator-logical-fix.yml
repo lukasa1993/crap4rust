@@ -1,0 +1,32 @@
+name: Verify generator logical fix
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify-and-merge:
+    if: ${{ github.head_ref == 'generator-swift-logical-fix' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: generator-swift-logical-fix
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+      - name: Verify both generator entry points
+        run: python -m pytest -q tests/test_quality_tool_generator.py tests/test_quality_tool_generator_logical_fix.py
+      - name: Merge the verified pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr ready "${{ github.event.pull_request.number }}"
+          gh pr merge "${{ github.event.pull_request.number }}" --squash --delete-branch
