@@ -1,0 +1,39 @@
+name: Audit production quality-tool portfolio
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  audit-and-merge:
+    if: ${{ github.head_ref == 'portfolio-production-audit' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: portfolio-production-audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install audit dependencies
+        run: python -m pip install --upgrade pip build pytest tree-sitter-language-pack==0.13.0
+      - name: Audit all 24 main branches
+        run: python tools/audit_quality_portfolio.py --report portfolio-audit.json
+      - name: Commit the verified audit record
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- portfolio-audit.json
+          git commit -m "Record passing production portfolio audit"
+          git push origin HEAD:portfolio-production-audit
+      - name: Merge the verified audit pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr ready "${{ github.event.pull_request.number }}"
+          gh pr merge "${{ github.event.pull_request.number }}" --merge --delete-branch
