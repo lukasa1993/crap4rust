@@ -1,19 +1,28 @@
 # crap4rust
 
-`crap4rust` calculates function-level CRAP scores for Rust source with a Tree-sitter syntax tree and executable-line coverage. Missing coverage is an error by default.
+Native Rust CRAP analysis. The executable is written in Rust and parses Rust with `syn`. It reads LCOV output from `cargo-llvm-cov` and requires complete function coverage by default.
+
+## Install
 
 ```bash
-pipx install git+https://github.com/lukasa1993/crap4rust.git
+cargo install --git https://github.com/lukasa1993/crap4rust --force
+cargo install cargo-llvm-cov --locked
+```
+
+## Run
+
+```bash
 crap4rust --fail-over 6
 ```
 
-Supported coverage inputs: LCOV, Cobertura XML, coverage.py JSON, Istanbul JSON, and LLVM export JSON. Use `--no-test` to analyze an existing report. Use `--allow-missing-coverage` only for exploratory work.
-
-Exit status: `0` pass, `1` configuration/execution/coverage error, `2` quality limit failure.
-
-## Development
+The default test command is:
 
 ```bash
-python -m pip install -e . pytest
-pytest -q
+cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info
 ```
+
+Use `--test-command` when the workspace has a different supported feature matrix. Use `--no-test` to read an existing LCOV report.
+
+Exit status: `0` pass, `1` execution/parse/coverage error, `2` CRAP limit failure.
+
+No Python, Node, JVM, or other language runtime is required.

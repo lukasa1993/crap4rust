@@ -1,9 +1,3 @@
 # crap4rust
 
-Use `crap4rust` for CRAP verification of Rust projects.
-
-1. Run `crap4rust --help` before first use.
-2. Use the project test/build commands that create current coverage or execute the full unit suite.
-3. Run the gate with `--fail-over 6`.
-4. Treat exit `1` as an infrastructure or configuration failure. Do not report it as a quality pass.
-5. Treat exit `2` as a quality-gate failure.
+Install with `cargo install --git https://github.com/lukasa1993/crap4rust --force`. Install `cargo-llvm-cov` for coverage. Run `crap4rust --fail-over 6`. Missing coverage is a failure by default. Exit `1` is an infrastructure/configuration failure; exit `2` is a CRAP gate failure.
