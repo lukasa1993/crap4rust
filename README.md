@@ -5,8 +5,9 @@ Native Rust CRAP analysis. The executable is written in Rust and parses Rust wit
 ## Install
 
 ```bash
-cargo install --git https://github.com/lukasa1993/crap4rust --force
+rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov --locked
+cargo install --git https://github.com/lukasa1993/crap4rust --force
 ```
 
 ## Run
