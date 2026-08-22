@@ -1,13 +1,13 @@
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{BinOp, Block, ExprBinary, ExprClosure, ItemFn};
+use syn::{Attribute, BinOp, Block, ExprBinary, ExprClosure, ItemFn};
 use thiserror::Error;
 use wait_timeout::ChildExt;
 use walkdir::{DirEntry, WalkDir};
@@ -69,6 +69,21 @@ fn is_test_path(path: &Path, root: &Path) -> bool {
             .is_some_and(|name| name.ends_with("_test.rs"))
 }
 
+fn is_auxiliary_path(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative.file_name().and_then(|name| name.to_str()) == Some("build.rs") {
+        return true;
+    }
+    relative.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("examples" | "benches" | "fuzz")
+        )
+    })
+}
+
 pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> Vec<PathBuf> {
     let mut files: Vec<_> = WalkDir::new(root)
         .into_iter()
@@ -77,6 +92,7 @@ pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> V
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+        .filter(|path| !is_auxiliary_path(path, root))
         .filter(|path| include_tests || !is_test_path(path, root))
         .filter(|path| {
             if filters.is_empty() {
@@ -88,6 +104,99 @@ pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> V
         .collect();
     files.sort();
     files
+}
+
+#[derive(Clone, Copy)]
+struct CfgPossibility {
+    can_be_true_without_test: bool,
+    can_be_false_without_test: bool,
+}
+
+impl CfgPossibility {
+    const UNKNOWN: Self = Self {
+        can_be_true_without_test: true,
+        can_be_false_without_test: true,
+    };
+}
+
+fn split_cfg_arguments(stream: TokenStream) -> Vec<TokenStream> {
+    let mut output = Vec::new();
+    let mut current = TokenStream::new();
+    for token in stream {
+        if matches!(&token, TokenTree::Punct(value) if value.as_char() == ',') {
+            if !current.is_empty() {
+                output.push(current);
+                current = TokenStream::new();
+            }
+        } else {
+            current.extend(std::iter::once(token));
+        }
+    }
+    if !current.is_empty() {
+        output.push(current);
+    }
+    output
+}
+
+fn cfg_possibility(stream: TokenStream) -> CfgPossibility {
+    let tokens: Vec<_> = stream.into_iter().collect();
+    if tokens.len() == 1 {
+        return match &tokens[0] {
+            TokenTree::Ident(value) if value == "test" => CfgPossibility {
+                can_be_true_without_test: false,
+                can_be_false_without_test: true,
+            },
+            TokenTree::Group(group) => cfg_possibility(group.stream()),
+            _ => CfgPossibility::UNKNOWN,
+        };
+    }
+    if tokens.len() != 2 {
+        return CfgPossibility::UNKNOWN;
+    }
+    let (TokenTree::Ident(operation), TokenTree::Group(group)) = (&tokens[0], &tokens[1]) else {
+        return CfgPossibility::UNKNOWN;
+    };
+    let possibilities: Vec<_> = split_cfg_arguments(group.stream())
+        .into_iter()
+        .map(cfg_possibility)
+        .collect();
+    match operation.to_string().as_str() {
+        "all" => CfgPossibility {
+            can_be_true_without_test: possibilities
+                .iter()
+                .all(|value| value.can_be_true_without_test),
+            can_be_false_without_test: possibilities
+                .iter()
+                .any(|value| value.can_be_false_without_test),
+        },
+        "any" => CfgPossibility {
+            can_be_true_without_test: possibilities
+                .iter()
+                .any(|value| value.can_be_true_without_test),
+            can_be_false_without_test: possibilities
+                .iter()
+                .all(|value| value.can_be_false_without_test),
+        },
+        "not" if possibilities.len() == 1 => CfgPossibility {
+            can_be_true_without_test: possibilities[0].can_be_false_without_test,
+            can_be_false_without_test: possibilities[0].can_be_true_without_test,
+        },
+        _ => CfgPossibility::UNKNOWN,
+    }
+}
+
+fn attrs_are_test_only(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        if attribute.path().is_ident("test") {
+            return true;
+        }
+        match &attribute.meta {
+            syn::Meta::List(list) if list.path.is_ident("cfg") => {
+                !cfg_possibility(list.tokens.clone()).can_be_true_without_test
+            }
+            _ => false,
+        }
+    })
 }
 
 fn slice_span(source: &str, span: Span) -> String {
@@ -168,11 +277,15 @@ fn collect_items(
     source: &str,
     file: &str,
     module_prefix: &str,
+    include_tests: bool,
     out: &mut Vec<FunctionMetric>,
 ) {
     for item in items {
         match item {
             syn::Item::Fn(function) => {
+                if !include_tests && attrs_are_test_only(&function.attrs) {
+                    continue;
+                }
                 let local = function.sig.ident.to_string();
                 let name = if module_prefix.is_empty() {
                     local
@@ -182,9 +295,15 @@ fn collect_items(
                 out.push(metric(name, file, function.span(), &function.block));
             }
             syn::Item::Impl(implementation) => {
+                if !include_tests && attrs_are_test_only(&implementation.attrs) {
+                    continue;
+                }
                 let owner = slice_span(source, implementation.self_ty.span());
                 for member in &implementation.items {
                     if let syn::ImplItem::Fn(function) = member {
+                        if !include_tests && attrs_are_test_only(&function.attrs) {
+                            continue;
+                        }
                         out.push(metric(
                             format!("{owner}::{}", function.sig.ident),
                             file,
@@ -195,9 +314,15 @@ fn collect_items(
                 }
             }
             syn::Item::Trait(trait_item) => {
+                if !include_tests && attrs_are_test_only(&trait_item.attrs) {
+                    continue;
+                }
                 let owner = trait_item.ident.to_string();
                 for member in &trait_item.items {
                     if let syn::TraitItem::Fn(function) = member {
+                        if !include_tests && attrs_are_test_only(&function.attrs) {
+                            continue;
+                        }
                         if let Some(block) = &function.default {
                             out.push(metric(
                                 format!("{owner}::{}", function.sig.ident),
@@ -210,13 +335,16 @@ fn collect_items(
                 }
             }
             syn::Item::Mod(module) => {
+                if !include_tests && attrs_are_test_only(&module.attrs) {
+                    continue;
+                }
                 if let Some((_, items)) = &module.content {
                     let next = if module_prefix.is_empty() {
                         module.ident.to_string()
                     } else {
                         format!("{module_prefix}::{}", module.ident)
                     };
-                    collect_items(items, source, file, &next, out);
+                    collect_items(items, source, file, &next, include_tests, out);
                 }
             }
             _ => {}
@@ -224,7 +352,11 @@ fn collect_items(
     }
 }
 
-pub fn extract_functions(path: &Path, root: &Path) -> Result<Vec<FunctionMetric>, Error> {
+fn extract_functions_with_tests(
+    path: &Path,
+    root: &Path,
+    include_tests: bool,
+) -> Result<Vec<FunctionMetric>, Error> {
     let source = fs::read_to_string(path)?;
     let syntax = syn::parse_file(&source).map_err(|source_error| Error::Parse {
         path: path.to_path_buf(),
@@ -236,9 +368,20 @@ pub fn extract_functions(path: &Path, root: &Path) -> Result<Vec<FunctionMetric>
         .to_string_lossy()
         .replace('\\', "/");
     let mut metrics = Vec::new();
-    collect_items(&syntax.items, &source, &relative, "", &mut metrics);
+    collect_items(
+        &syntax.items,
+        &source,
+        &relative,
+        "",
+        include_tests,
+        &mut metrics,
+    );
     metrics.sort_by_key(|item| (item.start_line, item.name.clone()));
     Ok(metrics)
+}
+
+pub fn extract_functions(path: &Path, root: &Path) -> Result<Vec<FunctionMetric>, Error> {
+    extract_functions_with_tests(path, root, false)
 }
 
 pub fn score(complexity: usize, coverage_percent: f64) -> f64 {
@@ -268,10 +411,12 @@ pub fn load_lcov(path: &Path) -> Result<Coverage, Error> {
             let line = fields.next().and_then(|value| value.parse::<usize>().ok());
             let count = fields.next().and_then(|value| value.parse::<u64>().ok());
             if let (Some(line), Some(count)) = (line, count) {
-                files
+                let entry = files
                     .entry(filename.clone())
                     .or_default()
-                    .insert(line, count);
+                    .entry(line)
+                    .or_default();
+                *entry = (*entry).max(count);
             }
         }
     }
@@ -338,7 +483,7 @@ pub fn analyze(
     let coverage = load_lcov(coverage_path)?;
     let mut metrics = Vec::new();
     for path in discover_files(root, include_tests, filters) {
-        metrics.extend(extract_functions(&path, root)?);
+        metrics.extend(extract_functions_with_tests(&path, root, include_tests)?);
     }
     apply_coverage(root, &mut metrics, &coverage);
     metrics.sort_by(|left, right| {
@@ -352,21 +497,51 @@ pub fn analyze(
     Ok(metrics)
 }
 
-pub fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<CommandResult, Error> {
+fn spawn_shell(command: &str, root: &Path) -> Result<Child, std::io::Error> {
     #[cfg(windows)]
-    let mut child = Command::new("cmd")
-        .args(["/C", command])
-        .current_dir(root)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let mut shell = {
+        let mut value = Command::new("cmd");
+        value.args(["/C", command]);
+        value
+    };
     #[cfg(not(windows))]
-    let mut child = Command::new("sh")
-        .args(["-c", command])
+    let mut shell = {
+        let mut value = Command::new("sh");
+        value.args(["-c", command]);
+        value
+    };
+    shell
         .current_dir(root)
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        shell.process_group(0);
+    }
+    shell.spawn()
+}
+
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(group) = i32::try_from(child.id()) {
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+pub fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<CommandResult, Error> {
+    let mut child = spawn_shell(command, root)?;
     match child.wait_timeout(timeout)? {
         Some(status) if status.success() => Ok(CommandResult { status }),
         Some(status) => Err(Error::Command {
@@ -374,7 +549,7 @@ pub fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<Comman
             command: command.to_string(),
         }),
         None => {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             let _ = child.wait();
             Err(Error::Timeout(timeout))
         }
@@ -405,6 +580,48 @@ mod tests {
     }
 
     #[test]
+    fn inline_test_modules_are_excluded_by_default() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("sample.rs");
+        fs::write(
+            &source,
+            "fn production() -> bool { true }\n#[cfg(test)]\nmod tests { #[test] fn helper() -> bool { false } }\n",
+        )
+        .unwrap();
+        let metrics = extract_functions(&source, dir.path()).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "production");
+    }
+
+    #[test]
+    fn cfg_not_test_functions_remain_in_scope() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("sample.rs");
+        fs::write(
+            &source,
+            "#[cfg(not(test))]\nfn production() -> bool { true }\n",
+        )
+        .unwrap();
+        let metrics = extract_functions(&source, dir.path()).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "production");
+    }
+
+    #[test]
+    fn discovery_excludes_build_scripts_and_auxiliary_targets() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("examples")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn production() {}\n").unwrap();
+        fs::write(dir.path().join("build.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("examples/demo.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(
+            discover_files(dir.path(), false, &[]),
+            vec![dir.path().join("src/lib.rs")]
+        );
+    }
+
+    #[test]
     fn maps_lcov_to_function_executable_lines() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("sample.rs");
@@ -429,8 +646,39 @@ mod tests {
     }
 
     #[test]
+    fn repeated_lcov_records_keep_the_highest_line_count() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("sample.rs");
+        fs::write(&source, "fn covered() -> i32 { 1 }\n").unwrap();
+        let coverage = dir.path().join("lcov.info");
+        fs::write(
+            &coverage,
+            format!(
+                "SF:{}\nDA:1,1\nend_of_record\nSF:{}\nDA:1,0\nend_of_record\n",
+                source.display(),
+                source.display()
+            ),
+        )
+        .unwrap();
+        let metrics = analyze(dir.path(), &coverage, false, &[]).unwrap();
+        assert_eq!(metrics[0].coverage, Some(100.0));
+    }
+
+    #[test]
     fn missing_lcov_is_an_error() {
         let dir = tempdir().unwrap();
         assert!(analyze(dir.path(), &dir.path().join("missing.info"), false, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_kills_descendant_processes() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("leaked.txt");
+        let command = "(sleep 0.2; printf leaked > leaked.txt) & wait";
+        let error = run_shell(command, dir.path(), Duration::from_millis(20)).unwrap_err();
+        assert!(matches!(error, Error::Timeout(_)));
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(!marker.exists());
     }
 }
