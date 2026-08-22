@@ -11,6 +11,30 @@ from _quality_tool_generator_data_2 import DATA as DATA_2
 from _quality_tool_generator_data_3 import DATA as DATA_3
 
 
+LICENSE_TEXT = """MIT License
+
+Copyright (c) 2026 Luka Dodelia
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the \"Software\"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+
 def _argument(name: str) -> str:
     try:
         index = sys.argv.index(name)
@@ -42,6 +66,8 @@ if result not in (None, 0):
 
 repository = _argument("--repo")
 output = Path(_argument("--output")).resolve()
+(output / "LICENSE").write_text(LICENSE_TEXT, encoding="utf-8")
+
 core = output / "src" / repository / "core.py"
 if core.is_file():
     text = core.read_text(encoding="utf-8")
