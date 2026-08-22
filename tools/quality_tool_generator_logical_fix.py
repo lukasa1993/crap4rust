@@ -12,19 +12,15 @@ from _quality_tool_generator_data_3 import DATA as DATA_3
 
 payload = DATA_1 + DATA_2 + DATA_3
 source = zlib.decompress(base64.b85decode(payload)).decode("utf-8")
-old = '''def _operator_count(node, source):
-    if node.type not in BINARY_TYPES:
+old = '''    if node.type not in BINARY_TYPES:
         return 0
-    count = 0
 '''
-new = '''def _operator_count(node, source):
-    # Tree-sitter grammars use different parent node names for logical
+new = '''    # Tree-sitter grammars use different parent node names for logical
     # expressions. Count only direct operator children. Each direct && or ||
     # token then contributes exactly once.
-    count = 0
 '''
-if old not in source:
-    raise RuntimeError("the reviewed generator no longer contains the expected operator counter")
+if source.count(old) != 1:
+    raise RuntimeError("the reviewed generator does not contain exactly one logical-operator guard")
 source = source.replace(old, new, 1)
 namespace = {
     "__name__": "__main__",
