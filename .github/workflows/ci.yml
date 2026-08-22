@@ -11,12 +11,12 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy,llvm-tools-preview
           rustup default stable
       - name: Format
         run: cargo fmt --all -- --check
@@ -31,7 +31,22 @@ jobs:
           cargo install --path . --root target/native-install --force
           target/native-install/bin/crap4rust --version
           target/native-install/bin/crap4rust --help
-      - name: Verify Rust coverage dependency
+      - name: Install Rust coverage tool
         run: |
           cargo install cargo-llvm-cov --locked
           cargo llvm-cov --version
+      - name: End-to-end Rust coverage and CRAP check
+        run: |
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/coverage-crate"
+          report="$fixture/target/coverage/lcov.info"
+          cd "$fixture"
+          cargo llvm-cov clean
+          mkdir -p target/coverage
+          cargo llvm-cov --all-features --lcov --output-path "$report"
+          test -s "$report"
+          "$GITHUB_WORKSPACE/target/native-install/bin/crap4rust" \
+            --root "$fixture" \
+            --coverage "$report" \
+            --no-test \
+            --fail-over 6 \
+            --json
