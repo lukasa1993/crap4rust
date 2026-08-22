@@ -37,3 +37,6 @@ def test_logical_fix_generator_builds_all_repositories(tmp_path: Path) -> None:
         assert project["name"] == repository
         assert project["version"] == "1.0.0"
         assert (output / "tests" / "test_core.py").is_file()
+        license_text = (output / "LICENSE").read_text(encoding="utf-8")
+        assert license_text.startswith("MIT License\n\nCopyright (c) 2026 Luka Dodelia\n")
+        assert license_text.endswith("SOFTWARE.\n")
