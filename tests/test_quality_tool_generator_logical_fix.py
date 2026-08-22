@@ -23,11 +23,17 @@ def test_logical_fix_generator_builds_all_repositories(tmp_path: Path) -> None:
     generator = Path(__file__).parents[1] / "tools" / "quality_tool_generator_logical_fix.py"
     for repository in REPOSITORIES:
         output = tmp_path / repository
-        subprocess.run(
+        completed = subprocess.run(
             [sys.executable, str(generator), "--repo", repository, "--output", str(output)],
-            check=True,
+            check=False,
+            text=True,
+            capture_output=True,
         )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
         assert compileall.compile_dir(output / "src", quiet=1)
+        assert compileall.compile_dir(output / "tests", quiet=1)
         with (output / "pyproject.toml").open("rb") as stream:
             project = tomllib.load(stream)["project"]
         assert project["name"] == repository
+        assert project["version"] == "1.0.0"
+        assert (output / "tests" / "test_core.py").is_file()
