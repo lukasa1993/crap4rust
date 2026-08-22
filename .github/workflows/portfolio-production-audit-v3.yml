@@ -1,0 +1,33 @@
+name: Audit production quality-tool portfolio v3
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    if: ${{ github.head_ref == 'portfolio-production-audit-v3' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: portfolio-production-audit-v3
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install audit build tools
+        run: python -m pip install --upgrade pip build
+      - name: Audit all 24 current main branches
+        run: python tools/audit_quality_portfolio_v3.py --report portfolio-audit-v3.json
+      - name: Upload exact audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolio-audit-v3
+          path: portfolio-audit-v3.json
+          if-no-files-found: warn
+          retention-days: 30
