@@ -13,6 +13,7 @@ from typing import Any, Iterable, Iterator, Sequence
 from tree_sitter_language_pack import get_parser
 
 LANGUAGE = 'rust'
+PARSER_BY_EXTENSION = {}
 DISPLAY_LANGUAGE = 'Rust'
 EXTENSIONS = ('.rs',)
 FUNCTION_TYPES = frozenset(('function_item',))
@@ -21,6 +22,15 @@ TEST_DIRS = frozenset(('tests',))
 TEST_SUFFIXES = ('_test.rs',)
 
 DECISION_TYPES: dict[str, frozenset[str]] = {
+    "typescript": frozenset({
+        "if_statement", "for_statement", "for_in_statement", "while_statement", "do_statement",
+        "switch_case", "catch_clause", "ternary_expression", "conditional_type",
+    }),
+    "python": frozenset({
+        "if_statement", "elif_clause", "for_statement", "while_statement", "except_clause",
+        "case_clause", "conditional_expression", "list_comprehension", "set_comprehension",
+        "dictionary_comprehension", "generator_expression",
+    }),
     "rust": frozenset({
         "if_expression", "for_expression", "while_expression", "loop_expression",
         "match_arm", "catch_clause", "conditional_expression",
@@ -49,7 +59,7 @@ DECISION_TYPES: dict[str, frozenset[str]] = {
 
 BINARY_TYPES = frozenset({
     "binary_expression", "logical_expression", "boolean_expression", "test_expression",
-    "arithmetic_expression", "compound_expression", "list",
+    "arithmetic_expression", "compound_expression", "list", "binary_operator", "boolean_operator",
 })
 NAME_TYPES = frozenset({
     "identifier", "field_identifier", "type_identifier", "simple_identifier", "word",
@@ -125,9 +135,13 @@ def discover_files(root: Path, filters: Sequence[str] = (), include_tests: bool 
     return files
 
 
+def parser_for_path(path: Path) -> Any:
+    return get_parser(PARSER_BY_EXTENSION.get(path.suffix.lower(), LANGUAGE))
+
+
 def parse_source(path: Path, allow_parse_errors: bool = False) -> tuple[bytes, Any]:
     source = path.read_bytes()
-    tree = get_parser(LANGUAGE).parse(source)
+    tree = parser_for_path(path).parse(source)
     if tree.root_node.has_error and not allow_parse_errors:
         errors: list[str] = []
         for node in _walk(tree.root_node):
@@ -170,11 +184,13 @@ def _qualified_owner(node: Any, source: bytes) -> str | None:
     parent = getattr(node, "parent", None)
     while parent is not None:
         if LANGUAGE == "rust" and parent.type == "impl_item":
-            target = parent.child_by_field_name("type")
-            if target is None:
-                target = parent.child_by_field_name("trait")
+            target = parent.child_by_field_name("type") or parent.child_by_field_name("trait")
             if target is not None:
                 return _node_text(target, source).strip()
+        if LANGUAGE == "typescript" and parent.type in {"class_declaration", "interface_declaration"}:
+            name = parent.child_by_field_name("name")
+            if name is not None:
+                return _node_text(name, source).strip()
         if LANGUAGE == "swift" and parent.type in {
             "class_declaration", "struct_declaration", "enum_declaration", "actor_declaration", "extension_declaration"
         }:
@@ -189,6 +205,12 @@ def function_name(node: Any, source: bytes) -> str:
     line = _point_row(node.start_point) + 1
     if node.type == "lambda_expression":
         return f"<lambda@{line}>"
+    if LANGUAGE == "typescript" and node.type in {"arrow_function", "function_expression"}:
+        parent = getattr(node, "parent", None)
+        if parent is not None:
+            parent_name = parent.child_by_field_name("name")
+            if parent_name is not None:
+                return _node_text(parent_name, source).strip()
     if LANGUAGE == "objc" and node.type == "method_definition":
         selector = _objective_c_selector(node, source)
         if selector:
@@ -207,12 +229,12 @@ def function_name(node: Any, source: bytes) -> str:
 
 
 def _operator_count(node: Any, source: bytes) -> int:
-    if node.type not in BINARY_TYPES:
-        return 0
+    # Tree-sitter grammars use different parent node names for logical
+    # expressions. Count direct && and || operator children once.
     count = 0
     for child in node.children:
         value = _node_text(child, source).strip()
-        if value in {"&&", "||"}:
+        if value in {"&&", "||", "and", "or"}:
             count += 1
     return count
 
@@ -253,6 +275,7 @@ def extract_functions(path: Path, root: Path, allow_parse_errors: bool = False) 
             )
         )
     if LANGUAGE == "bash":
+        function_ranges = [(metric.start_line, metric.end_line) for metric in metrics]
         top_level = [child for child in root_node.named_children if child.type not in FUNCTION_TYPES]
         if top_level:
             start = min(_point_row(child.start_point) + 1 for child in top_level)
