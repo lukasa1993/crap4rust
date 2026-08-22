@@ -322,7 +322,7 @@ pub fn apply_coverage(root: &Path, metrics: &mut [FunctionMetric], coverage: &Co
         if relevant.is_empty() {
             continue;
         }
-        let covered = relevant.iter().filter(|(_, count)| ***count > 0).count();
+        let covered = relevant.iter().filter(|(_, count)| **count > 0).count();
         let percent = 100.0 * covered as f64 / relevant.len() as f64;
         item.coverage = Some(percent);
         item.crap = Some(score(item.complexity, percent));
