@@ -2,10 +2,22 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import zlib
 
-from _quality_tool_generator_data_1 import DATA as DATA_1
-from _quality_tool_generator_data_2 import DATA as DATA_2
-from _quality_tool_generator_data_3 import DATA as DATA_3
 
-exec(compile(zlib.decompress(base64.b85decode(DATA_1 + DATA_2 + DATA_3)), __file__, "exec"))
+def _payload(module_name: str, part_name: str) -> str:
+    module = importlib.import_module(module_name)
+    for name in (part_name, "DATA"):
+        value = getattr(module, name, None)
+        if isinstance(value, str):
+            return value
+    raise RuntimeError(f"{module_name} does not define {part_name} or DATA")
+
+
+payload = (
+    _payload("_quality_tool_generator_data_1", "DATA_PART_1")
+    + _payload("_quality_tool_generator_data_2", "DATA_PART_2")
+    + _payload("_quality_tool_generator_data_3", "DATA_PART_3")
+)
+exec(compile(zlib.decompress(base64.b85decode(payload)), __file__, "exec"))
