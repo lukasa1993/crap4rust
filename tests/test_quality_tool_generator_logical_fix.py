@@ -36,7 +36,17 @@ def test_logical_fix_generator_builds_all_repositories(tmp_path: Path) -> None:
             project = tomllib.load(stream)["project"]
         assert project["name"] == repository
         assert project["version"] == "1.0.0"
+        assert project["license"] == "MIT"
+        assert project["license-files"] == ["LICENSE"]
+        assert "License :: OSI Approved :: MIT License" not in project["classifiers"]
         assert (output / "tests" / "test_core.py").is_file()
+
         license_text = (output / "LICENSE").read_text(encoding="utf-8")
         assert license_text.startswith("MIT License\n\nCopyright (c) 2026 Luka Dodelia\n")
         assert license_text.endswith("SOFTWARE.\n")
+
+        workflow = (output / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        assert "actions/checkout@v7" in workflow
+        assert "actions/setup-python@v7" in workflow
+        assert "actions/checkout@v4" not in workflow
+        assert "actions/setup-python@v5" not in workflow
