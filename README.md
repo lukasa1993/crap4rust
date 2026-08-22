@@ -1,19 +1,5 @@
 # crap4rust
 
-`crap4rust` calculates function-level CRAP scores for Rust source with a Tree-sitter syntax tree and executable-line coverage. Missing coverage is an error by default.
+Production CRAP analysis for Rust projects.
 
-```bash
-pipx install git+https://github.com/lukasa1993/crap4rust.git
-crap4rust --fail-over 6
-```
-
-Supported coverage inputs: LCOV, Cobertura XML, coverage.py JSON, Istanbul JSON, and LLVM export JSON. Use `--no-test` to analyze an existing report. Use `--allow-missing-coverage` only for exploratory work.
-
-Exit status: `0` pass, `1` configuration/execution/coverage error, `2` quality limit failure.
-
-## Development
-
-```bash
-python -m pip install -e . pytest
-pytest -q
-```
+This repository also hosts the reviewed generator used to build the related language quality tools. The generator branch is verified against all generated unit and target-language tests before merge.
