@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 const DEFAULT_COVERAGE: &str = "target/coverage/lcov.info";
-const DEFAULT_TEST: &str = "cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info";
+const DEFAULT_TEST: &str =
+    "cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info";
 
 #[derive(Parser, Debug)]
 #[command(name = "crap4rust", version = VERSION, about = "Native Rust CRAP metric analyzer")]
@@ -55,28 +56,54 @@ struct Summary {
 }
 
 fn resolve(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() { path.to_path_buf() } else { root.join(path) }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
 }
 
 fn is_safe_generated(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else { return false };
-    matches!(relative.components().next().and_then(|part| part.as_os_str().to_str()), Some("target" | "coverage" | ".coverage"))
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    matches!(
+        relative
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str()),
+        Some("target" | "coverage" | ".coverage")
+    )
 }
 
 fn prepare_coverage(root: &Path, coverage: &Path) -> Result<SystemTime, Error> {
-    if coverage.exists() && is_safe_generated(root, coverage) { fs::remove_file(coverage)?; }
-    if let Some(parent) = coverage.parent() { fs::create_dir_all(parent)?; }
+    if coverage.exists() && is_safe_generated(root, coverage) {
+        fs::remove_file(coverage)?;
+    }
+    if let Some(parent) = coverage.parent() {
+        fs::create_dir_all(parent)?;
+    }
     Ok(SystemTime::now())
 }
 
 fn print_table(metrics: &[FunctionMetric]) {
     println!("CRAP Report");
     println!("===========");
-    println!("{:<38} {:<42} {:>4} {:>7} {:>8}", "Function", "File", "CC", "Cov%", "CRAP");
+    println!(
+        "{:<38} {:<42} {:>4} {:>7} {:>8}",
+        "Function", "File", "CC", "Cov%", "CRAP"
+    );
     for item in metrics {
-        let coverage = item.coverage.map_or_else(|| "N/A".into(), |value| format!("{value:.1}%"));
-        let crap = item.crap.map_or_else(|| "N/A".into(), |value| format!("{value:.2}"));
-        println!("{:<38} {:<42} {:>4} {:>7} {:>8}", item.name, item.file, item.complexity, coverage, crap);
+        let coverage = item
+            .coverage
+            .map_or_else(|| "N/A".into(), |value| format!("{value:.1}%"));
+        let crap = item
+            .crap
+            .map_or_else(|| "N/A".into(), |value| format!("{value:.2}"));
+        println!(
+            "{:<38} {:<42} {:>4} {:>7} {:>8}",
+            item.name, item.file, item.complexity, coverage, crap
+        );
     }
 }
 
@@ -87,25 +114,74 @@ fn run() -> Result<u8, Error> {
     if !args.no_test {
         let started = prepare_coverage(&root, &coverage)?;
         run_shell(&args.test_command, &root, Duration::from_secs(args.timeout))?;
-        let metadata = fs::metadata(&coverage).map_err(|_| Error::Coverage(format!("coverage report was not created: {}", coverage.display())))?;
-        if metadata.len() == 0 { return Err(Error::Coverage(format!("coverage report is empty: {}", coverage.display()))); }
-        if metadata.modified().ok().is_some_and(|time| time < started) { return Err(Error::Coverage(format!("coverage report is stale: {}", coverage.display()))); }
+        let metadata = fs::metadata(&coverage).map_err(|_| {
+            Error::Coverage(format!(
+                "coverage report was not created: {}",
+                coverage.display()
+            ))
+        })?;
+        if metadata.len() == 0 {
+            return Err(Error::Coverage(format!(
+                "coverage report is empty: {}",
+                coverage.display()
+            )));
+        }
+        if metadata.modified().ok().is_some_and(|time| time < started) {
+            return Err(Error::Coverage(format!(
+                "coverage report is stale: {}",
+                coverage.display()
+            )));
+        }
     }
     let metrics = analyze(&root, &coverage, args.include_tests, &args.filters)?;
-    if metrics.is_empty() && !args.allow_empty { return Err(Error::Coverage("no Rust functions were discovered".into())); }
-    let missing = metrics.iter().filter(|item| item.coverage.is_none()).count();
-    if missing > 0 && !args.allow_missing_coverage { return Err(Error::Coverage(format!("coverage is missing for {missing} function(s)"))); }
-    let over = args.fail_over.map_or(0, |limit| metrics.iter().filter(|item| item.crap.is_some_and(|value| value > limit)).count());
+    if metrics.is_empty() && !args.allow_empty {
+        return Err(Error::Coverage("no Rust functions were discovered".into()));
+    }
+    let missing = metrics
+        .iter()
+        .filter(|item| item.coverage.is_none())
+        .count();
+    if missing > 0 && !args.allow_missing_coverage {
+        return Err(Error::Coverage(format!(
+            "coverage is missing for {missing} function(s)"
+        )));
+    }
+    let over = args.fail_over.map_or(0, |limit| {
+        metrics
+            .iter()
+            .filter(|item| item.crap.is_some_and(|value| value > limit))
+            .count()
+    });
     if args.json {
-        let report = Report { schema_version: 1, tool: "crap4rust", version: VERSION, root: root.to_string_lossy().to_string(), summary: Summary { functions: metrics.len(), missing_coverage: missing, over_limit: over, limit: args.fail_over }, functions: &metrics };
-        println!("{}", serde_json::to_string_pretty(&report).expect("serializable report"));
-    } else { print_table(&metrics); }
+        let report = Report {
+            schema_version: 1,
+            tool: "crap4rust",
+            version: VERSION,
+            root: root.to_string_lossy().to_string(),
+            summary: Summary {
+                functions: metrics.len(),
+                missing_coverage: missing,
+                over_limit: over,
+                limit: args.fail_over,
+            },
+            functions: &metrics,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("serializable report")
+        );
+    } else {
+        print_table(&metrics);
+    }
     Ok(if over > 0 { 2 } else { 0 })
 }
 
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
-        Err(error) => { eprintln!("crap4rust: {error}"); ExitCode::from(1) }
+        Err(error) => {
+            eprintln!("crap4rust: {error}");
+            ExitCode::from(1)
+        }
     }
 }

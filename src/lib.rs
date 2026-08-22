@@ -57,8 +57,12 @@ fn ignored(entry: &DirEntry) -> bool {
 }
 
 fn is_test_path(path: &Path, root: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else { return false };
-    relative.components().any(|part| part.as_os_str() == "tests")
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative
+        .components()
+        .any(|part| part.as_os_str() == "tests")
         || relative
             .file_name()
             .and_then(|name| name.to_str())
@@ -159,19 +163,34 @@ fn metric(name: String, file: &str, span: Span, block: &Block) -> FunctionMetric
     }
 }
 
-fn collect_items(items: &[syn::Item], source: &str, file: &str, module_prefix: &str, out: &mut Vec<FunctionMetric>) {
+fn collect_items(
+    items: &[syn::Item],
+    source: &str,
+    file: &str,
+    module_prefix: &str,
+    out: &mut Vec<FunctionMetric>,
+) {
     for item in items {
         match item {
             syn::Item::Fn(function) => {
                 let local = function.sig.ident.to_string();
-                let name = if module_prefix.is_empty() { local } else { format!("{module_prefix}::{local}") };
+                let name = if module_prefix.is_empty() {
+                    local
+                } else {
+                    format!("{module_prefix}::{local}")
+                };
                 out.push(metric(name, file, function.span(), &function.block));
             }
             syn::Item::Impl(implementation) => {
                 let owner = slice_span(source, implementation.self_ty.span());
                 for member in &implementation.items {
                     if let syn::ImplItem::Fn(function) = member {
-                        out.push(metric(format!("{owner}::{}", function.sig.ident), file, function.span(), &function.block));
+                        out.push(metric(
+                            format!("{owner}::{}", function.sig.ident),
+                            file,
+                            function.span(),
+                            &function.block,
+                        ));
                     }
                 }
             }
@@ -180,14 +199,23 @@ fn collect_items(items: &[syn::Item], source: &str, file: &str, module_prefix: &
                 for member in &trait_item.items {
                     if let syn::TraitItem::Fn(function) = member {
                         if let Some(block) = &function.default {
-                            out.push(metric(format!("{owner}::{}", function.sig.ident), file, function.span(), block));
+                            out.push(metric(
+                                format!("{owner}::{}", function.sig.ident),
+                                file,
+                                function.span(),
+                                block,
+                            ));
                         }
                     }
                 }
             }
             syn::Item::Mod(module) => {
                 if let Some((_, items)) = &module.content {
-                    let next = if module_prefix.is_empty() { module.ident.to_string() } else { format!("{module_prefix}::{}", module.ident) };
+                    let next = if module_prefix.is_empty() {
+                        module.ident.to_string()
+                    } else {
+                        format!("{module_prefix}::{}", module.ident)
+                    };
                     collect_items(items, source, file, &next, out);
                 }
             }
@@ -198,8 +226,15 @@ fn collect_items(items: &[syn::Item], source: &str, file: &str, module_prefix: &
 
 pub fn extract_functions(path: &Path, root: &Path) -> Result<Vec<FunctionMetric>, Error> {
     let source = fs::read_to_string(path)?;
-    let syntax = syn::parse_file(&source).map_err(|source_error| Error::Parse { path: path.to_path_buf(), source: source_error })?;
-    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+    let syntax = syn::parse_file(&source).map_err(|source_error| Error::Parse {
+        path: path.to_path_buf(),
+        source: source_error,
+    })?;
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
     let mut metrics = Vec::new();
     collect_items(&syntax.items, &source, &relative, "", &mut metrics);
     metrics.sort_by_key(|item| (item.start_line, item.name.clone()));
@@ -212,11 +247,15 @@ pub fn score(complexity: usize, coverage_percent: f64) -> f64 {
 }
 
 fn normalize_path(value: &str) -> String {
-    value.replace('\\', "/").trim_start_matches("./").to_string()
+    value
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
 }
 
 pub fn load_lcov(path: &Path) -> Result<Coverage, Error> {
-    let text = fs::read_to_string(path).map_err(|error| Error::Coverage(format!("cannot read {}: {error}", path.display())))?;
+    let text = fs::read_to_string(path)
+        .map_err(|error| Error::Coverage(format!("cannot read {}: {error}", path.display())))?;
     let mut files: HashMap<String, HashMap<usize, u64>> = HashMap::new();
     let mut current: Option<String> = None;
     for raw in text.lines() {
@@ -229,30 +268,60 @@ pub fn load_lcov(path: &Path) -> Result<Coverage, Error> {
             let line = fields.next().and_then(|value| value.parse::<usize>().ok());
             let count = fields.next().and_then(|value| value.parse::<u64>().ok());
             if let (Some(line), Some(count)) = (line, count) {
-                files.entry(filename.clone()).or_default().insert(line, count);
+                files
+                    .entry(filename.clone())
+                    .or_default()
+                    .insert(line, count);
             }
         }
     }
     if files.values().all(HashMap::is_empty) {
-        return Err(Error::Coverage(format!("{} contains no executable line data", path.display())));
+        return Err(Error::Coverage(format!(
+            "{} contains no executable line data",
+            path.display()
+        )));
     }
     Ok(Coverage { files })
 }
 
-fn coverage_lines<'a>(coverage: &'a Coverage, root: &Path, filename: &str) -> Option<&'a HashMap<usize, u64>> {
+fn coverage_lines<'a>(
+    coverage: &'a Coverage,
+    root: &Path,
+    filename: &str,
+) -> Option<&'a HashMap<usize, u64>> {
     let normalized = normalize_path(filename);
-    if let Some(value) = coverage.files.get(&normalized) { return Some(value); }
+    if let Some(value) = coverage.files.get(&normalized) {
+        return Some(value);
+    }
     let absolute = normalize_path(&root.join(filename).to_string_lossy());
-    if let Some(value) = coverage.files.get(&absolute) { return Some(value); }
-    let suffix: Vec<_> = coverage.files.iter().filter(|(candidate, _)| candidate.ends_with(&format!("/{normalized}"))).map(|(_, lines)| lines).collect();
-    if suffix.len() == 1 { Some(suffix[0]) } else { None }
+    if let Some(value) = coverage.files.get(&absolute) {
+        return Some(value);
+    }
+    let suffix: Vec<_> = coverage
+        .files
+        .iter()
+        .filter(|(candidate, _)| candidate.ends_with(&format!("/{normalized}")))
+        .map(|(_, lines)| lines)
+        .collect();
+    if suffix.len() == 1 {
+        Some(suffix[0])
+    } else {
+        None
+    }
 }
 
 pub fn apply_coverage(root: &Path, metrics: &mut [FunctionMetric], coverage: &Coverage) {
     for item in metrics {
-        let Some(lines) = coverage_lines(coverage, root, &item.file) else { continue };
-        let relevant: Vec<_> = lines.iter().filter(|(line, _)| **line >= item.start_line && **line <= item.end_line).collect();
-        if relevant.is_empty() { continue; }
+        let Some(lines) = coverage_lines(coverage, root, &item.file) else {
+            continue;
+        };
+        let relevant: Vec<_> = lines
+            .iter()
+            .filter(|(line, _)| **line >= item.start_line && **line <= item.end_line)
+            .collect();
+        if relevant.is_empty() {
+            continue;
+        }
         let covered = relevant.iter().filter(|(_, count)| ***count > 0).count();
         let percent = 100.0 * covered as f64 / relevant.len() as f64;
         item.coverage = Some(percent);
@@ -260,24 +329,55 @@ pub fn apply_coverage(root: &Path, metrics: &mut [FunctionMetric], coverage: &Co
     }
 }
 
-pub fn analyze(root: &Path, coverage_path: &Path, include_tests: bool, filters: &[String]) -> Result<Vec<FunctionMetric>, Error> {
+pub fn analyze(
+    root: &Path,
+    coverage_path: &Path,
+    include_tests: bool,
+    filters: &[String],
+) -> Result<Vec<FunctionMetric>, Error> {
     let coverage = load_lcov(coverage_path)?;
     let mut metrics = Vec::new();
-    for path in discover_files(root, include_tests, filters) { metrics.extend(extract_functions(&path, root)?); }
+    for path in discover_files(root, include_tests, filters) {
+        metrics.extend(extract_functions(&path, root)?);
+    }
     apply_coverage(root, &mut metrics, &coverage);
-    metrics.sort_by(|left, right| right.crap.partial_cmp(&left.crap).unwrap_or(std::cmp::Ordering::Equal).then_with(|| left.file.cmp(&right.file)).then_with(|| left.start_line.cmp(&right.start_line)));
+    metrics.sort_by(|left, right| {
+        right
+            .crap
+            .partial_cmp(&left.crap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
     Ok(metrics)
 }
 
 pub fn run_shell(command: &str, root: &Path, timeout: Duration) -> Result<CommandResult, Error> {
     #[cfg(windows)]
-    let mut child = Command::new("cmd").args(["/C", command]).current_dir(root).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn()?;
+    let mut child = Command::new("cmd")
+        .args(["/C", command])
+        .current_dir(root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
     #[cfg(not(windows))]
-    let mut child = Command::new("sh").args(["-c", command]).current_dir(root).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn()?;
+    let mut child = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
     match child.wait_timeout(timeout)? {
         Some(status) if status.success() => Ok(CommandResult { status }),
-        Some(status) => Err(Error::Command { code: status.code().unwrap_or(1), command: command.to_string() }),
-        None => { let _ = child.kill(); let _ = child.wait(); Err(Error::Timeout(timeout)) }
+        Some(status) => Err(Error::Command {
+            code: status.code().unwrap_or(1),
+            command: command.to_string(),
+        }),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(Error::Timeout(timeout))
+        }
     }
 }
 
@@ -308,9 +408,20 @@ mod tests {
     fn maps_lcov_to_function_executable_lines() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("sample.rs");
-        fs::write(&source, "fn choose(x: bool) -> i32 {\n if x { 1 } else { 0 }\n}\n").unwrap();
+        fs::write(
+            &source,
+            "fn choose(x: bool) -> i32 {\n if x { 1 } else { 0 }\n}\n",
+        )
+        .unwrap();
         let coverage = dir.path().join("lcov.info");
-        fs::write(&coverage, format!("SF:{}\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\n", source.display())).unwrap();
+        fs::write(
+            &coverage,
+            format!(
+                "SF:{}\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\n",
+                source.display()
+            ),
+        )
+        .unwrap();
         let metrics = analyze(dir.path(), &coverage, false, &[]).unwrap();
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].coverage, Some(200.0 / 3.0));
