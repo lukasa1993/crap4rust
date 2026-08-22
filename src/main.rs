@@ -1,0 +1,111 @@
+use clap::Parser;
+use crap4rust::{analyze, run_shell, Error, FunctionMetric, VERSION};
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::{Duration, SystemTime};
+
+const DEFAULT_COVERAGE: &str = "target/coverage/lcov.info";
+const DEFAULT_TEST: &str = "cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info";
+
+#[derive(Parser, Debug)]
+#[command(name = "crap4rust", version = VERSION, about = "Native Rust CRAP metric analyzer")]
+struct Args {
+    #[arg(value_name = "PATH_FRAGMENT")]
+    filters: Vec<String>,
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    #[arg(long, default_value = DEFAULT_COVERAGE)]
+    coverage: PathBuf,
+    #[arg(long, default_value = DEFAULT_TEST)]
+    test_command: String,
+    #[arg(long, default_value_t = 1800)]
+    timeout: u64,
+    #[arg(long)]
+    no_test: bool,
+    #[arg(long)]
+    allow_missing_coverage: bool,
+    #[arg(long)]
+    allow_empty: bool,
+    #[arg(long)]
+    include_tests: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    fail_over: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct Report<'a> {
+    schema_version: u8,
+    tool: &'static str,
+    version: &'static str,
+    root: String,
+    summary: Summary,
+    functions: &'a [FunctionMetric],
+}
+
+#[derive(Serialize)]
+struct Summary {
+    functions: usize,
+    missing_coverage: usize,
+    over_limit: usize,
+    limit: Option<f64>,
+}
+
+fn resolve(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() { path.to_path_buf() } else { root.join(path) }
+}
+
+fn is_safe_generated(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else { return false };
+    matches!(relative.components().next().and_then(|part| part.as_os_str().to_str()), Some("target" | "coverage" | ".coverage"))
+}
+
+fn prepare_coverage(root: &Path, coverage: &Path) -> Result<SystemTime, Error> {
+    if coverage.exists() && is_safe_generated(root, coverage) { fs::remove_file(coverage)?; }
+    if let Some(parent) = coverage.parent() { fs::create_dir_all(parent)?; }
+    Ok(SystemTime::now())
+}
+
+fn print_table(metrics: &[FunctionMetric]) {
+    println!("CRAP Report");
+    println!("===========");
+    println!("{:<38} {:<42} {:>4} {:>7} {:>8}", "Function", "File", "CC", "Cov%", "CRAP");
+    for item in metrics {
+        let coverage = item.coverage.map_or_else(|| "N/A".into(), |value| format!("{value:.1}%"));
+        let crap = item.crap.map_or_else(|| "N/A".into(), |value| format!("{value:.2}"));
+        println!("{:<38} {:<42} {:>4} {:>7} {:>8}", item.name, item.file, item.complexity, coverage, crap);
+    }
+}
+
+fn run() -> Result<u8, Error> {
+    let args = Args::parse();
+    let root = args.root.canonicalize()?;
+    let coverage = resolve(&root, &args.coverage);
+    if !args.no_test {
+        let started = prepare_coverage(&root, &coverage)?;
+        run_shell(&args.test_command, &root, Duration::from_secs(args.timeout))?;
+        let metadata = fs::metadata(&coverage).map_err(|_| Error::Coverage(format!("coverage report was not created: {}", coverage.display())))?;
+        if metadata.len() == 0 { return Err(Error::Coverage(format!("coverage report is empty: {}", coverage.display()))); }
+        if metadata.modified().ok().is_some_and(|time| time < started) { return Err(Error::Coverage(format!("coverage report is stale: {}", coverage.display()))); }
+    }
+    let metrics = analyze(&root, &coverage, args.include_tests, &args.filters)?;
+    if metrics.is_empty() && !args.allow_empty { return Err(Error::Coverage("no Rust functions were discovered".into())); }
+    let missing = metrics.iter().filter(|item| item.coverage.is_none()).count();
+    if missing > 0 && !args.allow_missing_coverage { return Err(Error::Coverage(format!("coverage is missing for {missing} function(s)"))); }
+    let over = args.fail_over.map_or(0, |limit| metrics.iter().filter(|item| item.crap.is_some_and(|value| value > limit)).count());
+    if args.json {
+        let report = Report { schema_version: 1, tool: "crap4rust", version: VERSION, root: root.to_string_lossy().to_string(), summary: Summary { functions: metrics.len(), missing_coverage: missing, over_limit: over, limit: args.fail_over }, functions: &metrics };
+        println!("{}", serde_json::to_string_pretty(&report).expect("serializable report"));
+    } else { print_table(&metrics); }
+    Ok(if over > 0 { 2 } else { 0 })
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => { eprintln!("crap4rust: {error}"); ExitCode::from(1) }
+    }
+}
