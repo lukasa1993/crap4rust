@@ -68,6 +68,38 @@ repository = _argument("--repo")
 output = Path(_argument("--output")).resolve()
 (output / "LICENSE").write_text(LICENSE_TEXT, encoding="utf-8")
 
+pyproject = output / "pyproject.toml"
+metadata = pyproject.read_text(encoding="utf-8")
+metadata = _replace_once(
+    metadata,
+    'license = {text = "MIT"}\n',
+    'license = "MIT"\nlicense-files = ["LICENSE"]\n',
+    "license metadata",
+)
+metadata = _replace_once(
+    metadata,
+    '  "License :: OSI Approved :: MIT License",\n',
+    "",
+    "deprecated license classifier",
+)
+pyproject.write_text(metadata, encoding="utf-8")
+
+workflow = output / ".github" / "workflows" / "ci.yml"
+workflow_text = workflow.read_text(encoding="utf-8")
+workflow_text = _replace_once(
+    workflow_text,
+    "actions/checkout@v4",
+    "actions/checkout@v7",
+    "checkout action reference",
+)
+workflow_text = _replace_once(
+    workflow_text,
+    "actions/setup-python@v5",
+    "actions/setup-python@v7",
+    "setup-python action reference",
+)
+workflow.write_text(workflow_text, encoding="utf-8")
+
 core = output / "src" / repository / "core.py"
 if core.is_file():
     text = core.read_text(encoding="utf-8")
