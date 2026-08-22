@@ -2,16 +2,26 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import zlib
 from pathlib import Path
 
-from _quality_tool_generator_data_1 import DATA_PART_1
-from _quality_tool_generator_data_2 import DATA_PART_2
-from _quality_tool_generator_data_3 import DATA_PART_3
+
+def _payload(module_name: str, part_name: str) -> str:
+    module = importlib.import_module(module_name)
+    for name in (part_name, "DATA"):
+        value = getattr(module, name, None)
+        if isinstance(value, str):
+            return value
+    raise RuntimeError(f"{module_name} does not define {part_name} or DATA")
 
 
-payload = DATA_PART_1 + DATA_PART_2 + DATA_PART_3
-source = zlib.decompress(base64.b85decode(payload.encode("ascii"))).decode("utf-8")
+payload = (
+    _payload("_quality_tool_generator_data_1", "DATA_PART_1")
+    + _payload("_quality_tool_generator_data_2", "DATA_PART_2")
+    + _payload("_quality_tool_generator_data_3", "DATA_PART_3")
+)
+source = zlib.decompress(base64.b85decode(payload)).decode("utf-8")
 old = '''def _operator_count(node, source):
     if node.type not in BINARY_TYPES:
         return 0
