@@ -292,7 +292,6 @@ fn prefix(parent: &str, child: &str) -> String {
 
 fn walk_modules(
     items: &[syn::Item],
-    current_path: &Path,
     module_dir: &Path,
     module_prefix: &str,
     context: &CfgContext,
@@ -309,15 +308,7 @@ fn walk_modules(
         let next_prefix = prefix(module_prefix, &module.ident.to_string());
         if let Some((_, nested)) = &module.content {
             let nested_dir = module_dir.join(module.ident.to_string());
-            walk_modules(
-                nested,
-                current_path,
-                &nested_dir,
-                &next_prefix,
-                context,
-                visited,
-                output,
-            )?;
+            walk_modules(nested, &nested_dir, &next_prefix, context, visited, output)?;
             continue;
         }
         let child = resolve_module(module, module_dir, context)?;
@@ -352,7 +343,6 @@ fn visit_file(
     let module_dir = module_directory(&canonical, crate_root);
     walk_modules(
         &syntax.items,
-        &canonical,
         &module_dir,
         module_prefix,
         context,
@@ -387,6 +377,13 @@ fn fallback_files(root: &Path, include_tests: bool) -> Vec<ScopedFile> {
             })
         })
         .filter(|path| path.file_name().and_then(|value| value.to_str()) != Some("build.rs"))
+        .filter(|path| {
+            include_tests
+                || !path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with("_test.rs"))
+        })
         .filter(|path| {
             include_tests
                 || !path
