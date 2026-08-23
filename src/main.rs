@@ -75,16 +75,15 @@ fn resolve(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn is_safe_generated(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
+    let Ok(candidate) = path.canonicalize() else {
         return false;
     };
-    matches!(
-        relative
-            .components()
-            .next()
-            .and_then(|part| part.as_os_str().to_str()),
-        Some("target" | "coverage" | ".coverage")
-    )
+    ["target", "coverage", ".coverage"].iter().any(|name| {
+        root.join(name)
+            .canonicalize()
+            .ok()
+            .is_some_and(|generated_root| candidate.starts_with(generated_root))
+    })
 }
 
 fn prepare_coverage(root: &Path, coverage: &Path) -> Result<SystemTime, Error> {
@@ -197,5 +196,61 @@ fn main() -> ExitCode {
             eprintln!("crap4rust: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generated_target_file_is_safe_to_remove() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target/coverage");
+        fs::create_dir_all(&target).unwrap();
+        let report = target.join("lcov.info");
+        fs::write(&report, "old coverage").unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        assert!(is_safe_generated(&root, &report));
+        prepare_coverage(&root, &report).unwrap();
+        assert!(!report.exists());
+    }
+
+    #[test]
+    fn traversal_through_target_does_not_delete_project_file() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("target")).unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname='safe'\nversion='0.1.0'\n").unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let traversal = root.join("target/../Cargo.toml");
+
+        assert!(traversal.exists());
+        assert!(!is_safe_generated(&root, &traversal));
+        prepare_coverage(&root, &traversal).unwrap();
+        assert!(manifest.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_directory_symlink_cannot_escape_cleanup_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = dir.path().join("target/coverage");
+        fs::create_dir_all(&target).unwrap();
+        let outside_file = outside.path().join("outside.info");
+        fs::write(&outside_file, "keep me").unwrap();
+        let report = target.join("lcov.info");
+        symlink(&outside_file, &report).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        assert!(!is_safe_generated(&root, &report));
+        prepare_coverage(&root, &report).unwrap();
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), "keep me");
+        assert!(report.exists());
     }
 }
