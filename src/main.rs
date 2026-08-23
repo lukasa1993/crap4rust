@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 const DEFAULT_COVERAGE: &str = "target/coverage/lcov.info";
 const DEFAULT_TEST: &str =
-    "cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info";
+    "cargo llvm-cov --workspace --lcov --output-path target/coverage/lcov.info";
 
 #[derive(Parser, Debug)]
 #[command(name = "crap4rust", version = VERSION, about = "Native Rust CRAP metric analyzer")]

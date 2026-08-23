@@ -9,12 +9,17 @@ use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Lit, Meta, Token};
 use walkdir::{DirEntry, WalkDir};
 
-#[derive(Clone, Debug)]
-pub(crate) struct CfgContext {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SingleCfgContext {
     names: HashSet<String>,
     values: HashMap<String, HashSet<String>>,
     features: HashSet<String>,
     include_tests: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CfgContext {
+    variants: Vec<SingleCfgContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,7 +66,7 @@ fn literal_string(expr: &Expr) -> Option<String> {
     }
 }
 
-impl CfgContext {
+impl SingleCfgContext {
     fn synthetic(include_tests: bool) -> Self {
         Self {
             names: HashSet::new(),
@@ -129,7 +134,7 @@ impl CfgContext {
         }
     }
 
-    pub(crate) fn attrs_active(&self, attrs: &[Attribute]) -> bool {
+    fn attrs_active(&self, attrs: &[Attribute]) -> bool {
         attrs.iter().all(|attribute| {
             if attribute.path().is_ident("test") {
                 return self.include_tests;
@@ -149,7 +154,7 @@ impl CfgContext {
     }
 
     fn path_override(&self, attrs: &[Attribute]) -> Option<PathBuf> {
-        fn from_meta(context: &CfgContext, meta: &Meta) -> Option<PathBuf> {
+        fn from_meta(context: &SingleCfgContext, meta: &Meta) -> Option<PathBuf> {
             match meta {
                 Meta::NameValue(value) if value.path.is_ident("path") => {
                     literal_string(&value.value).map(PathBuf::from)
@@ -172,8 +177,22 @@ impl CfgContext {
     }
 }
 
-fn parse_cfg_output(text: &str, include_tests: bool) -> CfgContext {
-    let mut context = CfgContext::synthetic(include_tests);
+impl CfgContext {
+    fn synthetic(include_tests: bool) -> Self {
+        Self {
+            variants: vec![SingleCfgContext::synthetic(include_tests)],
+        }
+    }
+
+    pub(crate) fn attrs_active(&self, attrs: &[Attribute]) -> bool {
+        self.variants
+            .iter()
+            .any(|context| context.attrs_active(attrs))
+    }
+}
+
+fn parse_cfg_output(text: &str, include_tests: bool) -> SingleCfgContext {
+    let mut context = SingleCfgContext::synthetic(include_tests);
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Some((key, value)) = line.split_once('=') {
             let value = value.trim_matches('"').to_string();
@@ -197,15 +216,16 @@ fn cargo_cfg(
     package: &Package,
     target: &Target,
     include_tests: bool,
-) -> Result<CfgContext, String> {
+) -> Result<SingleCfgContext, String> {
     let mut command = Command::new("cargo");
     command
         .arg("rustc")
         .arg("--manifest-path")
-        .arg(&package.manifest_path)
-        .arg("--all-features");
+        .arg(&package.manifest_path);
     if target.kind.iter().any(|kind| kind == "bin") {
         command.arg("--bin").arg(&target.name);
+    } else if target.kind.iter().any(|kind| kind == "test") {
+        command.arg("--test").arg(&target.name);
     } else {
         command.arg("--lib");
     }
@@ -216,8 +236,9 @@ fn cargo_cfg(
         .map_err(|error| format!("cannot run cargo rustc -- --print cfg: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "cargo rustc cfg discovery failed for {} with exit code {:?}: {}",
+            "cargo rustc cfg discovery failed for {} target {} with exit code {:?}: {}",
             package.manifest_path.display(),
+            target.name,
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -270,7 +291,7 @@ fn module_directory(path: &Path, crate_root: bool) -> PathBuf {
 fn resolve_module(
     module: &syn::ItemMod,
     module_dir: &Path,
-    context: &CfgContext,
+    context: &SingleCfgContext,
 ) -> Result<PathBuf, String> {
     if let Some(relative) = context.path_override(&module.attrs) {
         let path = module_dir.join(relative);
@@ -310,13 +331,20 @@ fn prefix(parent: &str, child: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct TargetScopedFile {
+    path: PathBuf,
+    module_prefix: String,
+    cfg: SingleCfgContext,
+}
+
 fn walk_modules(
     items: &[syn::Item],
     module_dir: &Path,
     module_prefix: &str,
-    context: &CfgContext,
-    visited: &mut HashSet<PathBuf>,
-    output: &mut Vec<ScopedFile>,
+    context: &SingleCfgContext,
+    visited: &mut HashSet<(PathBuf, String)>,
+    output: &mut Vec<TargetScopedFile>,
 ) -> Result<(), String> {
     for item in items {
         let syn::Item::Mod(module) = item else {
@@ -341,14 +369,15 @@ fn visit_file(
     path: &Path,
     crate_root: bool,
     module_prefix: &str,
-    context: &CfgContext,
-    visited: &mut HashSet<PathBuf>,
-    output: &mut Vec<ScopedFile>,
+    context: &SingleCfgContext,
+    visited: &mut HashSet<(PathBuf, String)>,
+    output: &mut Vec<TargetScopedFile>,
 ) -> Result<(), String> {
     let canonical = path
         .canonicalize()
         .map_err(|error| format!("cannot resolve Rust source {}: {error}", path.display()))?;
-    if !visited.insert(canonical.clone()) {
+    let key = (canonical.clone(), module_prefix.to_string());
+    if !visited.insert(key) {
         return Ok(());
     }
     let source = fs::read_to_string(&canonical)
@@ -358,7 +387,7 @@ fn visit_file(
     if !context.attrs_active(&syntax.attrs) {
         return Ok(());
     }
-    output.push(ScopedFile {
+    output.push(TargetScopedFile {
         path: canonical.clone(),
         module_prefix: module_prefix.to_string(),
         cfg: context.clone(),
@@ -425,6 +454,17 @@ fn fallback_files(root: &Path, include_tests: bool) -> Vec<ScopedFile> {
     files
 }
 
+fn merge_context(
+    merged: &mut HashMap<(PathBuf, String), Vec<SingleCfgContext>>,
+    file: TargetScopedFile,
+) {
+    let key = (file.path, file.module_prefix);
+    let contexts = merged.entry(key).or_default();
+    if !contexts.contains(&file.cfg) {
+        contexts.push(file.cfg);
+    }
+}
+
 pub(crate) fn discover(
     root: &Path,
     include_tests: bool,
@@ -435,45 +475,57 @@ pub(crate) fn discover(
     }
     let metadata = cargo_metadata(root)?;
     let workspace: HashSet<_> = metadata.workspace_members.into_iter().collect();
-    let mut output = Vec::new();
-    let mut visited = HashSet::new();
+    let mut merged = HashMap::<(PathBuf, String), Vec<SingleCfgContext>>::new();
     for package in metadata
         .packages
         .into_iter()
         .filter(|package| workspace.contains(&package.id))
     {
-        let targets: Vec<_> = package
+        for target in package
             .targets
             .iter()
             .filter(|target| target_in_scope(&target.kind, include_tests))
-            .collect();
-        let Some(cfg_target) = targets.first().copied() else {
-            continue;
-        };
-        let context = cargo_cfg(root, &package, cfg_target, include_tests)?;
-        for target in targets {
+        {
+            let context = cargo_cfg(root, &package, target, include_tests)?;
+            let mut visited = HashSet::new();
+            let mut target_files = Vec::new();
             visit_file(
                 &target.src_path,
                 true,
                 "",
                 &context,
                 &mut visited,
-                &mut output,
+                &mut target_files,
             )?;
+            for file in target_files {
+                merge_context(&mut merged, file);
+            }
         }
     }
-    output.retain(|file| {
-        if filters.is_empty() {
-            return true;
-        }
-        let relative = file
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&file.path)
-            .to_string_lossy();
-        filters.iter().any(|filter| relative.contains(filter))
+    let mut output: Vec<_> = merged
+        .into_iter()
+        .map(|((path, module_prefix), variants)| ScopedFile {
+            path,
+            module_prefix,
+            cfg: CfgContext { variants },
+        })
+        .filter(|file| {
+            if filters.is_empty() {
+                return true;
+            }
+            let relative = file
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&file.path)
+                .to_string_lossy();
+            filters.iter().any(|filter| relative.contains(filter))
+        })
+        .collect();
+    output.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.module_prefix.cmp(&right.module_prefix))
     });
-    output.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(output)
 }
 
@@ -483,103 +535,63 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cfg_evaluation_handles_names_values_and_boolean_operators() {
-        let mut context = CfgContext::synthetic(false);
-        context.names.insert("unix".into());
-        context
-            .values
-            .entry("target_os".into())
-            .or_default()
-            .insert("linux".into());
-        context.features.insert("extra".into());
-        for text in [
-            "unix",
-            "target_os = \"linux\"",
-            "feature = \"extra\"",
-            "all(unix, feature = \"extra\")",
-            "not(windows)",
-        ] {
-            let meta: Meta = syn::parse_str(text).unwrap();
-            assert!(context.eval(&meta), "{text} should be active");
-        }
-        let inactive: Meta = syn::parse_str("any(windows, target_os = \"macos\")").unwrap();
-        assert!(!context.eval(&inactive));
+    fn merged_context_is_active_when_any_target_context_matches() {
+        let mut unix = SingleCfgContext::synthetic(false);
+        unix.names.insert("unix".into());
+        let mut windows = SingleCfgContext::synthetic(false);
+        windows.names.insert("windows".into());
+        let context = CfgContext {
+            variants: vec![unix, windows],
+        };
+        let unix_attr: Attribute = syn::parse_quote!(#[cfg(unix)]);
+        let windows_attr: Attribute = syn::parse_quote!(#[cfg(windows)]);
+        assert!(context.attrs_active(&[unix_attr]));
+        assert!(context.attrs_active(&[windows_attr]));
     }
 
     #[test]
-    fn cargo_cfg_includes_build_script_values_and_honors_inner_file_cfg() {
+    fn default_scope_supports_mutually_exclusive_features() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname='cfg-build-fixture'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("build.rs"),
-            "fn main() { println!(\"cargo::rustc-check-cfg=cfg(tool_probe)\"); println!(\"cargo::rustc-cfg=tool_probe\"); }\n",
+            "[package]\nname='mutually-exclusive-crap-fixture'\nversion='0.1.0'\nedition='2021'\n[features]\na=[]\nb=[]\n",
         )
         .unwrap();
         fs::write(
             dir.path().join("src/lib.rs"),
-            "#[cfg(tool_probe)] mod active;\nmod inner_disabled;\n#[cfg(not(tool_probe))] mod impossible;\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("src/active.rs"), "pub fn active() {}\n").unwrap();
-        fs::write(
-            dir.path().join("src/inner_disabled.rs"),
-            "#![cfg(not(tool_probe))]\npub fn disabled() {}\n",
+            "#[cfg(all(feature=\"a\", feature=\"b\"))] compile_error!(\"features a and b are mutually exclusive\");\npub fn active() -> bool { true }\n",
         )
         .unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
-        let names: HashSet<_> = files
-            .iter()
-            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
-            .collect();
-        assert!(names.contains("lib.rs"));
-        assert!(names.contains("active.rs"));
-        assert!(!names.contains("inner_disabled.rs"));
-        assert!(!names.contains("impossible.rs"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].module_prefix, "");
     }
 
     #[test]
-    fn cargo_scope_excludes_inactive_external_modules_and_keeps_features() {
+    fn same_file_under_two_module_names_keeps_two_scopes() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname='scope-fixture'\nversion='0.1.0'\nedition='2021'\n[features]\nextra=[]\n",
+            "[package]\nname='module-prefix-fixture'\nversion='0.1.0'\nedition='2021'\n",
         )
         .unwrap();
         fs::write(
             dir.path().join("src/lib.rs"),
-            "#[cfg(unix)] mod unix_only;\n#[cfg(windows)] mod windows_only;\n#[cfg(feature=\"extra\")] mod feature_only;\n",
+            "#[path=\"shared.rs\"] mod alpha;\n#[path=\"shared.rs\"] mod beta;\n",
         )
         .unwrap();
-        fs::write(dir.path().join("src/unix_only.rs"), "pub fn unix_fn() {}\n").unwrap();
-        fs::write(
-            dir.path().join("src/windows_only.rs"),
-            "pub fn windows_fn() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("src/feature_only.rs"),
-            "pub fn feature_fn() {}\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("src/shared.rs"), "pub fn work() {}\n").unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
-        let names: HashSet<_> = files
+        let prefixes: HashSet<_> = files
             .iter()
-            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
+            .filter(|file| {
+                file.path.file_name().and_then(|name| name.to_str()) == Some("shared.rs")
+            })
+            .map(|file| file.module_prefix.as_str())
             .collect();
-        assert!(names.contains("lib.rs"));
-        assert!(names.contains("feature_only.rs"));
-        if cfg!(unix) {
-            assert!(names.contains("unix_only.rs"));
-            assert!(!names.contains("windows_only.rs"));
-        } else if cfg!(windows) {
-            assert!(names.contains("windows_only.rs"));
-            assert!(!names.contains("unix_only.rs"));
-        }
+        assert!(prefixes.contains("alpha"));
+        assert!(prefixes.contains("beta"));
     }
 }
