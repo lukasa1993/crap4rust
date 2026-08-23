@@ -356,25 +356,11 @@ fn walk_modules(
         let next_prefix = prefix(module_prefix, &module.ident.to_string());
         if let Some((_, nested)) = &module.content {
             let nested_dir = module_dir.join(module.ident.to_string());
-            walk_modules(
-                nested,
-                &nested_dir,
-                &next_prefix,
-                context,
-                visited,
-                output,
-            )?;
+            walk_modules(nested, &nested_dir, &next_prefix, context, visited, output)?;
             continue;
         }
         let child = resolve_module(module, module_dir, context)?;
-        visit_file(
-            &child,
-            false,
-            &next_prefix,
-            context,
-            visited,
-            output,
-        )?;
+        visit_file(&child, false, &next_prefix, context, visited, output)?;
     }
     Ok(())
 }
@@ -600,7 +586,9 @@ mod tests {
         let files = discover(dir.path(), false, &[]).unwrap();
         let prefixes: HashSet<_> = files
             .iter()
-            .filter(|file| file.path.file_name().and_then(|name| name.to_str()) == Some("shared.rs"))
+            .filter(|file| {
+                file.path.file_name().and_then(|name| name.to_str()) == Some("shared.rs")
+            })
             .map(|file| file.module_prefix.as_str())
             .collect();
         assert!(prefixes.contains("alpha"));
