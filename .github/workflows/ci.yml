@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  apply-rust-scope:
+  apply-rust-scope-review:
     if: github.ref == 'refs/heads/rust-scope-v202' || github.event.pull_request.head.ref == 'rust-scope-v202'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -22,28 +22,26 @@ jobs:
           fetch-depth: 0
       - name: Install stable Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-      - name: Integrate and verify Cargo-aware Rust scope
+      - name: Apply and verify final scope review fixes
         shell: bash
         run: |
-          if grep -q '^mod scope;' src/lib.rs; then
-            echo 'Rust scope integration is already applied.'
+          if ! grep -q 'current_path: &Path' src/scope.rs && grep -q 'ends_with("_test.rs")' src/scope.rs; then
+            echo 'Scope review fixes are already applied.'
             exit 0
           fi
           mkdir -p target
-          rustc tools/patch_rust_scope.rs -o target/patch-rust-scope
-          target/patch-rust-scope
-          rustc tools/fix_syn3_scope.rs -o target/fix-syn3-scope
-          target/fix-syn3-scope
+          rustc tools/fix_scope_review.rs -o target/fix-scope-review
+          target/fix-scope-review
           cargo fmt --all
-          cargo check --all-targets --all-features
-          cargo test --all-targets --all-features
           cargo check --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock src/lib.rs src/scope.rs
-          git commit -m "Use Cargo-aware Rust scope and complete complexity"
+          git add src/scope.rs
+          git commit -m "Finish Cargo-aware Rust scope review"
           git fetch origin rust-scope-v202
           git rebase origin/rust-scope-v202
           git push origin HEAD:rust-scope-v202
