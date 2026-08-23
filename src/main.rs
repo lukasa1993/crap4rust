@@ -121,11 +121,8 @@ fn print_table(metrics: &[FunctionMetric]) {
 fn run() -> Result<u8, Error> {
     let args = Args::parse();
     let root = args.root.canonicalize()?;
-    let cargo_args = cargo_proxy::feature_args(
-        &args.features,
-        args.all_features,
-        args.no_default_features,
-    );
+    let cargo_args =
+        cargo_proxy::feature_args(&args.features, args.all_features, args.no_default_features);
     let _cargo_proxy = cargo_proxy::install(&root, "crap4rust", &cargo_args)?;
     let coverage = resolve(&root, &args.coverage);
     if !args.no_test {
