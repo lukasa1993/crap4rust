@@ -347,15 +347,23 @@ fn include_literal(tokens: TokenStream) -> Option<LitStr> {
     parser.parse2(tokens).ok()
 }
 
+fn built_in_include(path: &syn::Path) -> bool {
+    let segments: Vec<_> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    matches!(segments.as_slice(), [name] if name == "include")
+        || matches!(segments.as_slice(), [prefix, name]
+            if matches!(prefix.as_str(), "std" | "core") && name == "include")
+}
+
 fn static_include_path(item: &syn::ItemMacro, source_dir: &Path) -> Option<PathBuf> {
-    if !item.mac.path.is_ident("include") {
+    if !built_in_include(&item.mac.path) {
         return None;
     }
     let literal = include_literal(item.mac.tokens.clone())?;
     let path = PathBuf::from(literal.value());
-    if path.extension().and_then(|value| value.to_str()) != Some("rs") {
-        return None;
-    }
     Some(if path.is_absolute() {
         path
     } else {
@@ -445,6 +453,7 @@ fn visit_file(
     visited: &mut HashSet<(PathBuf, String)>,
     output: &mut Vec<TargetScopedFile>,
 ) -> Result<(), String> {
+    let lexical_source_dir = path.parent().unwrap_or(module_dir).to_path_buf();
     let canonical = path
         .canonicalize()
         .map_err(|error| format!("cannot resolve Rust source {}: {error}", path.display()))?;
@@ -464,11 +473,10 @@ fn visit_file(
         module_prefix: module_prefix.to_string(),
         cfg: context.clone(),
     });
-    let source_dir = canonical.parent().unwrap_or(module_dir);
     walk_items(
         &syntax.items,
         module_dir,
-        source_dir,
+        &lexical_source_dir,
         module_prefix,
         context,
         visited,
@@ -663,6 +671,56 @@ mod tests {
         .unwrap();
         let files = discover(dir.path(), false, &[]).unwrap();
         assert!(files.iter().any(|file| file.path.ends_with("baz.rs")));
+    }
+
+    #[test]
+    fn qualified_extensionless_include_is_discovered() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='qualified-extensionless-include-fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "core::include!(\"generated\",);\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/generated"),
+            "pub fn included() -> bool { true }\n",
+        )
+        .unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        assert!(files
+            .iter()
+            .any(|file| file.path.ends_with("src/generated")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_module_include_uses_lexical_source_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("shared")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='crap-symlink-include-fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "mod foo;\n").unwrap();
+        fs::write(dir.path().join("shared/foo.rs"), "include!(\"part.rs\");\n").unwrap();
+        fs::write(
+            dir.path().join("src/part.rs"),
+            "pub fn lexical() -> bool { true }\n",
+        )
+        .unwrap();
+        symlink("../shared/foo.rs", dir.path().join("src/foo.rs")).unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        assert!(files.iter().any(|file| file.path.ends_with("src/part.rs")));
     }
 
     #[test]
