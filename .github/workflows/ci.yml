@@ -65,6 +65,19 @@ jobs:
             --no-test \
             --fail-over 6 \
             --json
+      - name: End-to-end explicit feature selection
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/feature-crate"
+          output="$($GITHUB_WORKSPACE/target/native-install/bin/crap4rust \
+            --root "$fixture" \
+            --features extra \
+            --fail-over 6 \
+            --json)"
+          printf '%s\n' "$output"
+          grep -q '"name": "feature_only"' <<<"$output"
+          grep -q '"missing_coverage": 0' <<<"$output"
 
   msrv:
     runs-on: ubuntu-latest

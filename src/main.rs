@@ -1,3 +1,5 @@
+mod cargo_proxy;
+
 use clap::Parser;
 use crap4rust::{analyze, run_shell, Error, FunctionMetric, VERSION};
 use serde::Serialize;
@@ -17,6 +19,15 @@ struct Args {
     filters: Vec<String>,
     #[arg(long, default_value = ".")]
     root: PathBuf,
+    /// Cargo features to enable for source scope and built-in Cargo commands.
+    #[arg(long, value_delimiter = ',', conflicts_with = "all_features")]
+    features: Vec<String>,
+    /// Disable Cargo default features. May be combined with --features.
+    #[arg(long, conflicts_with = "all_features")]
+    no_default_features: bool,
+    /// Enable every Cargo feature. Fails normally if the project forbids that combination.
+    #[arg(long)]
+    all_features: bool,
     #[arg(long, default_value = DEFAULT_COVERAGE)]
     coverage: PathBuf,
     #[arg(long, default_value = DEFAULT_TEST)]
@@ -110,6 +121,9 @@ fn print_table(metrics: &[FunctionMetric]) {
 fn run() -> Result<u8, Error> {
     let args = Args::parse();
     let root = args.root.canonicalize()?;
+    let cargo_args =
+        cargo_proxy::feature_args(&args.features, args.all_features, args.no_default_features);
+    let _cargo_proxy = cargo_proxy::install(&root, "crap4rust", &cargo_args)?;
     let coverage = resolve(&root, &args.coverage);
     if !args.no_test {
         let started = prepare_coverage(&root, &coverage)?;
