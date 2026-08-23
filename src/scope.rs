@@ -33,12 +33,13 @@ struct Metadata {
 #[derive(Deserialize)]
 struct Package {
     id: String,
-    features: HashMap<String, Vec<String>>,
+    manifest_path: PathBuf,
     targets: Vec<Target>,
 }
 
 #[derive(Deserialize)]
 struct Target {
+    name: String,
     kind: Vec<String>,
     src_path: PathBuf,
 }
@@ -68,12 +69,6 @@ impl CfgContext {
             features: HashSet::new(),
             include_tests,
         }
-    }
-
-    fn with_features(&self, features: impl IntoIterator<Item = String>) -> Self {
-        let mut value = self.clone();
-        value.features = features.into_iter().collect();
-        value
     }
 
     fn eval(&self, meta: &Meta) -> bool {
@@ -177,24 +172,14 @@ impl CfgContext {
     }
 }
 
-fn rustc_cfg(root: &Path, include_tests: bool) -> Result<CfgContext, String> {
-    let output = Command::new("rustc")
-        .args(["--print", "cfg"])
-        .current_dir(root)
-        .output()
-        .map_err(|error| format!("cannot run rustc --print cfg: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustc --print cfg failed with exit code {:?}",
-            output.status.code()
-        ));
-    }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|error| format!("rustc --print cfg returned invalid UTF-8: {error}"))?;
+fn parse_cfg_output(text: &str, include_tests: bool) -> CfgContext {
     let mut context = CfgContext::synthetic(include_tests);
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Some((key, value)) = line.split_once('=') {
             let value = value.trim_matches('"').to_string();
+            if key == "feature" {
+                context.features.insert(value.clone());
+            }
             context
                 .values
                 .entry(key.to_string())
@@ -204,7 +189,42 @@ fn rustc_cfg(root: &Path, include_tests: bool) -> Result<CfgContext, String> {
             context.names.insert(line.to_string());
         }
     }
-    Ok(context)
+    context
+}
+
+fn cargo_cfg(
+    root: &Path,
+    package: &Package,
+    target: &Target,
+    include_tests: bool,
+) -> Result<CfgContext, String> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("rustc")
+        .arg("--manifest-path")
+        .arg(&package.manifest_path)
+        .arg("--all-features");
+    if target.kind.iter().any(|kind| kind == "bin") {
+        command.arg("--bin").arg(&target.name);
+    } else {
+        command.arg("--lib");
+    }
+    let output = command
+        .args(["--", "--print", "cfg"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run cargo rustc -- --print cfg: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo rustc cfg discovery failed for {} with exit code {:?}: {}",
+            package.manifest_path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("cargo rustc cfg output is invalid UTF-8: {error}"))?;
+    Ok(parse_cfg_output(&text, include_tests))
 }
 
 fn cargo_metadata(root: &Path) -> Result<Metadata, String> {
@@ -335,6 +355,9 @@ fn visit_file(
         .map_err(|error| format!("cannot read Rust source {}: {error}", canonical.display()))?;
     let syntax = syn::parse_file(&source)
         .map_err(|error| format!("Rust parse error in {}: {error}", canonical.display()))?;
+    if !context.attrs_active(&syntax.attrs) {
+        return Ok(());
+    }
     output.push(ScopedFile {
         path: canonical.clone(),
         module_prefix: module_prefix.to_string(),
@@ -411,7 +434,6 @@ pub(crate) fn discover(
         return Ok(fallback_files(root, include_tests));
     }
     let metadata = cargo_metadata(root)?;
-    let base = rustc_cfg(root, include_tests)?;
     let workspace: HashSet<_> = metadata.workspace_members.into_iter().collect();
     let mut output = Vec::new();
     let mut visited = HashSet::new();
@@ -420,12 +442,16 @@ pub(crate) fn discover(
         .into_iter()
         .filter(|package| workspace.contains(&package.id))
     {
-        let context = base.with_features(package.features.keys().cloned());
-        for target in package
+        let targets: Vec<_> = package
             .targets
-            .into_iter()
+            .iter()
             .filter(|target| target_in_scope(&target.kind, include_tests))
-        {
+            .collect();
+        let Some(cfg_target) = targets.first().copied() else {
+            continue;
+        };
+        let context = cargo_cfg(root, &package, cfg_target, include_tests)?;
+        for target in targets {
             visit_file(
                 &target.src_path,
                 true,
@@ -478,6 +504,42 @@ mod tests {
         }
         let inactive: Meta = syn::parse_str("any(windows, target_os = \"macos\")").unwrap();
         assert!(!context.eval(&inactive));
+    }
+
+    #[test]
+    fn cargo_cfg_includes_build_script_values_and_honors_inner_file_cfg() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='cfg-build-fixture'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("build.rs"),
+            "fn main() { println!(\"cargo::rustc-check-cfg=cfg(tool_probe)\"); println!(\"cargo::rustc-cfg=tool_probe\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[cfg(tool_probe)] mod active;\nmod inner_disabled;\n#[cfg(not(tool_probe))] mod impossible;\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/active.rs"), "pub fn active() {}\n").unwrap();
+        fs::write(
+            dir.path().join("src/inner_disabled.rs"),
+            "#![cfg(not(tool_probe))]\npub fn disabled() {}\n",
+        )
+        .unwrap();
+        let files = discover(dir.path(), false, &[]).unwrap();
+        let names: HashSet<_> = files
+            .iter()
+            .filter_map(|file| file.path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert!(names.contains("lib.rs"));
+        assert!(names.contains("active.rs"));
+        assert!(!names.contains("inner_disabled.rs"));
+        assert!(!names.contains("impossible.rs"));
     }
 
     #[test]
