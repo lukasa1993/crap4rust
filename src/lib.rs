@@ -1,4 +1,6 @@
-use proc_macro2::{Span, TokenStream, TokenTree};
+mod scope;
+
+use proc_macro2::Span;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -7,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, BinOp, Block, ExprBinary, ExprClosure, ItemFn};
+use syn::{BinOp, Block, ExprBinary};
 use thiserror::Error;
 use wait_timeout::ChildExt;
 use walkdir::{DirEntry, WalkDir};
@@ -22,6 +24,8 @@ pub enum Error {
     Parse { path: PathBuf, source: syn::Error },
     #[error("coverage report error: {0}")]
     Coverage(String),
+    #[error("Rust scope error: {0}")]
+    Scope(String),
     #[error("command timed out after {0:?}")]
     Timeout(Duration),
     #[error("command failed with exit code {code}: {command}")]
@@ -106,99 +110,6 @@ pub fn discover_files(root: &Path, include_tests: bool, filters: &[String]) -> V
     files
 }
 
-#[derive(Clone, Copy)]
-struct CfgPossibility {
-    can_be_true_without_test: bool,
-    can_be_false_without_test: bool,
-}
-
-impl CfgPossibility {
-    const UNKNOWN: Self = Self {
-        can_be_true_without_test: true,
-        can_be_false_without_test: true,
-    };
-}
-
-fn split_cfg_arguments(stream: TokenStream) -> Vec<TokenStream> {
-    let mut output = Vec::new();
-    let mut current = TokenStream::new();
-    for token in stream {
-        if matches!(&token, TokenTree::Punct(value) if value.as_char() == ',') {
-            if !current.is_empty() {
-                output.push(current);
-                current = TokenStream::new();
-            }
-        } else {
-            current.extend(std::iter::once(token));
-        }
-    }
-    if !current.is_empty() {
-        output.push(current);
-    }
-    output
-}
-
-fn cfg_possibility(stream: TokenStream) -> CfgPossibility {
-    let tokens: Vec<_> = stream.into_iter().collect();
-    if tokens.len() == 1 {
-        return match &tokens[0] {
-            TokenTree::Ident(value) if value == "test" => CfgPossibility {
-                can_be_true_without_test: false,
-                can_be_false_without_test: true,
-            },
-            TokenTree::Group(group) => cfg_possibility(group.stream()),
-            _ => CfgPossibility::UNKNOWN,
-        };
-    }
-    if tokens.len() != 2 {
-        return CfgPossibility::UNKNOWN;
-    }
-    let (TokenTree::Ident(operation), TokenTree::Group(group)) = (&tokens[0], &tokens[1]) else {
-        return CfgPossibility::UNKNOWN;
-    };
-    let possibilities: Vec<_> = split_cfg_arguments(group.stream())
-        .into_iter()
-        .map(cfg_possibility)
-        .collect();
-    match operation.to_string().as_str() {
-        "all" => CfgPossibility {
-            can_be_true_without_test: possibilities
-                .iter()
-                .all(|value| value.can_be_true_without_test),
-            can_be_false_without_test: possibilities
-                .iter()
-                .any(|value| value.can_be_false_without_test),
-        },
-        "any" => CfgPossibility {
-            can_be_true_without_test: possibilities
-                .iter()
-                .any(|value| value.can_be_true_without_test),
-            can_be_false_without_test: possibilities
-                .iter()
-                .all(|value| value.can_be_false_without_test),
-        },
-        "not" if possibilities.len() == 1 => CfgPossibility {
-            can_be_true_without_test: possibilities[0].can_be_false_without_test,
-            can_be_false_without_test: possibilities[0].can_be_true_without_test,
-        },
-        _ => CfgPossibility::UNKNOWN,
-    }
-}
-
-fn attrs_are_test_only(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attribute| {
-        if attribute.path().is_ident("test") {
-            return true;
-        }
-        match &attribute.meta {
-            syn::Meta::List(list) if list.path.is_ident("cfg") => {
-                !cfg_possibility(list.tokens.clone()).can_be_true_without_test
-            }
-            _ => false,
-        }
-    })
-}
-
 fn slice_span(source: &str, span: Span) -> String {
     let range = span.byte_range();
     source.get(range).unwrap_or_default().trim().to_string()
@@ -242,6 +153,11 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
         visit::visit_arm(self, node);
     }
 
+    fn visit_pat_guard(&mut self, node: &'ast syn::PatGuard) {
+        self.value += 1;
+        visit::visit_pat_guard(self, node);
+    }
+
     fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
         if matches!(node.op, BinOp::And(_) | BinOp::Or(_)) {
             self.value += 1;
@@ -249,13 +165,21 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
         visit::visit_expr_binary(self, node);
     }
 
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if node
+            .init
+            .as_ref()
+            .is_some_and(|init| init.diverge.is_some())
+        {
+            self.value += 1;
+        }
+        visit::visit_local(self, node);
+    }
+
     fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
         self.value += 1;
         visit::visit_expr_try(self, node);
     }
-
-    fn visit_expr_closure(&mut self, _node: &'ast ExprClosure) {}
-    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
 }
 
 fn metric(name: String, file: &str, span: Span, block: &Block) -> FunctionMetric {
@@ -277,13 +201,13 @@ fn collect_items(
     source: &str,
     file: &str,
     module_prefix: &str,
-    include_tests: bool,
+    cfg: &scope::CfgContext,
     out: &mut Vec<FunctionMetric>,
 ) {
     for item in items {
         match item {
             syn::Item::Fn(function) => {
-                if !include_tests && attrs_are_test_only(&function.attrs) {
+                if !cfg.attrs_active(&function.attrs) {
                     continue;
                 }
                 let local = function.sig.ident.to_string();
@@ -295,13 +219,13 @@ fn collect_items(
                 out.push(metric(name, file, function.span(), &function.block));
             }
             syn::Item::Impl(implementation) => {
-                if !include_tests && attrs_are_test_only(&implementation.attrs) {
+                if !cfg.attrs_active(&implementation.attrs) {
                     continue;
                 }
                 let owner = slice_span(source, implementation.self_ty.span());
                 for member in &implementation.items {
                     if let syn::ImplItem::Fn(function) = member {
-                        if !include_tests && attrs_are_test_only(&function.attrs) {
+                        if !cfg.attrs_active(&function.attrs) {
                             continue;
                         }
                         out.push(metric(
@@ -314,13 +238,13 @@ fn collect_items(
                 }
             }
             syn::Item::Trait(trait_item) => {
-                if !include_tests && attrs_are_test_only(&trait_item.attrs) {
+                if !cfg.attrs_active(&trait_item.attrs) {
                     continue;
                 }
                 let owner = trait_item.ident.to_string();
                 for member in &trait_item.items {
                     if let syn::TraitItem::Fn(function) = member {
-                        if !include_tests && attrs_are_test_only(&function.attrs) {
+                        if !cfg.attrs_active(&function.attrs) {
                             continue;
                         }
                         if let Some(block) = &function.default {
@@ -335,7 +259,7 @@ fn collect_items(
                 }
             }
             syn::Item::Mod(module) => {
-                if !include_tests && attrs_are_test_only(&module.attrs) {
+                if !cfg.attrs_active(&module.attrs) {
                     continue;
                 }
                 if let Some((_, items)) = &module.content {
@@ -344,7 +268,7 @@ fn collect_items(
                     } else {
                         format!("{module_prefix}::{}", module.ident)
                     };
-                    collect_items(items, source, file, &next, include_tests, out);
+                    collect_items(items, source, file, &next, cfg, out);
                 }
             }
             _ => {}
@@ -352,19 +276,16 @@ fn collect_items(
     }
 }
 
-fn extract_functions_with_tests(
-    path: &Path,
-    root: &Path,
-    include_tests: bool,
-) -> Result<Vec<FunctionMetric>, Error> {
-    let source = fs::read_to_string(path)?;
+fn extract_scoped(scoped: &scope::ScopedFile, root: &Path) -> Result<Vec<FunctionMetric>, Error> {
+    let source = fs::read_to_string(&scoped.path)?;
     let syntax = syn::parse_file(&source).map_err(|source_error| Error::Parse {
-        path: path.to_path_buf(),
+        path: scoped.path.clone(),
         source: source_error,
     })?;
-    let relative = path
+    let relative = scoped
+        .path
         .strip_prefix(root)
-        .unwrap_or(path)
+        .unwrap_or(&scoped.path)
         .to_string_lossy()
         .replace('\\', "/");
     let mut metrics = Vec::new();
@@ -372,12 +293,36 @@ fn extract_functions_with_tests(
         &syntax.items,
         &source,
         &relative,
-        "",
-        include_tests,
+        &scoped.module_prefix,
+        &scoped.cfg,
         &mut metrics,
     );
     metrics.sort_by_key(|item| (item.start_line, item.name.clone()));
     Ok(metrics)
+}
+
+fn extract_functions_with_tests(
+    path: &Path,
+    root: &Path,
+    include_tests: bool,
+) -> Result<Vec<FunctionMetric>, Error> {
+    let canonical = path.canonicalize()?;
+    let scoped = scope::discover(root, include_tests, &[]).map_err(Error::Scope)?;
+    let file = scoped
+        .into_iter()
+        .find(|file| {
+            file.path
+                .canonicalize()
+                .ok()
+                .is_some_and(|candidate| candidate == canonical)
+        })
+        .ok_or_else(|| {
+            Error::Scope(format!(
+                "Rust source is not active in the selected Cargo scope: {}",
+                path.display()
+            ))
+        })?;
+    extract_scoped(&file, root)
 }
 
 pub fn extract_functions(path: &Path, root: &Path) -> Result<Vec<FunctionMetric>, Error> {
@@ -481,9 +426,10 @@ pub fn analyze(
     filters: &[String],
 ) -> Result<Vec<FunctionMetric>, Error> {
     let coverage = load_lcov(coverage_path)?;
+    let scoped = scope::discover(root, include_tests, filters).map_err(Error::Scope)?;
     let mut metrics = Vec::new();
-    for path in discover_files(root, include_tests, filters) {
-        metrics.extend(extract_functions_with_tests(&path, root, include_tests)?);
+    for file in &scoped {
+        metrics.extend(extract_scoped(file, root)?);
     }
     apply_coverage(root, &mut metrics, &coverage);
     metrics.sort_by(|left, right| {
@@ -577,6 +523,24 @@ mod tests {
         let choose = metrics.iter().find(|item| item.name == "choose").unwrap();
         assert!(choose.complexity >= 4);
         assert!(metrics.iter().any(|item| item.name == "Thing::value"));
+    }
+
+    #[test]
+    fn closure_nested_items_match_guards_and_let_else_contribute_complexity() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("sample.rs");
+        fs::write(
+            &source,
+            "fn outer(value: Option<i32>) -> i32 {\n let decide = |a: bool, b: bool| if a && b { 1 } else { 0 };\n let Some(value) = value else { return 0; };\n fn nested(x: i32) -> i32 { match x { n if n > 0 => n, _ => 0 } }\n decide(true, true) + nested(value)\n}\n",
+        )
+        .unwrap();
+        let metrics = extract_functions(&source, dir.path()).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!(
+            metrics[0].complexity >= 7,
+            "complexity was {}",
+            metrics[0].complexity
+        );
     }
 
     #[test]
